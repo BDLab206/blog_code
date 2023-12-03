@@ -1,0 +1,133 @@
+from itertools import combinations
+import gurobipy as gp
+import numpy as np
+import tsplib95
+import math
+import csv
+import datetime
+import folium
+
+# 记录开始时间
+start_time = datetime.datetime.now()
+
+# 获取原始数据，目标是获得城市id（1到n）以及城市与城市两两之间的距离
+filename = 'berlin8'
+filename_tsp = filename + '.tsp'
+DATA = tsplib95.load('data/tsp/' + filename_tsp)
+num_of_city = DATA.dimension
+# cities为1到num_of_city的整数数组，表示第1到第n个城市
+cities = list(range(1, num_of_city + 1))
+# coordinates是城市坐标，是求距离的依据
+coordinates = DATA.node_coords
+
+
+# 求城市两两之间距离的方法
+def distance(city1, city2):
+    c1 = coordinates[city1]
+    c2 = coordinates[city2]
+    diff = (c1[0] - c2[0], c1[1] - c2[1])
+    return np.around(math.sqrt(diff[0] * diff[0] + diff[1] * diff[1]))
+
+
+# dist为元组到实数的字典，键为元组表示哪两个城市，值为实数表示这两个城市间的距离
+# 需要注意，combinations的使用，意味着没有"(i,i)"，同时"(i,j)"与"(j,i)"只有一个
+dist = {(c1, c2): distance(c1, c2) for c1, c2 in combinations(cities, 2)}
+
+# 模型转换耗时
+print(f"模型转换耗时为：{datetime.datetime.now() - start_time}.")
+
+# 开始gurobi建模
+m = gp.Model()
+
+# 决策变量，如果城市i与城市j有连接，则此变量为1，否则为0。
+# 这里把dist中的值直接当做了系数，因此后面没有设置目标函数
+vars = m.addVars(dist.keys(), obj=dist, vtype=gp.GRB.BINARY, name='x')
+
+# 补上"(j,i)"，j和i是否联系的情况与j和i是否联系的情况严格一致
+for i, j in vars.keys():
+    vars[j, i] = vars[i, j]
+
+# 出入约束，每个城市最多只能与两个城市有联系
+# cons = m.addConstrs(vars.sum(c, '*') == 2 for c in cities)
+# quicksum版
+cons = m.addConstrs(gp.quicksum(vars[c, '*']) for c in cities)
+
+
+# Callback函数 - 用懒惰约束来消除子圈
+def subtourelim(model, where):
+    if where == gp.GRB.Callback.MIPSOL:
+        # 获得当前解决策变量的取值
+        vals = model.cbGetSolution(model._vars)
+        # 把取值为1的决策变量拿出来形成一个tuplelist类型数据，用于找子圈
+        selected = gp.tuplelist((i, j) for i, j in model._vars.keys()
+                                if vals[i, j] > 0.5)
+        # 找到最短的子圈，用于破圈
+        tour = subtour(selected)
+        if len(tour) < len(cities):
+            # 增加懒惰约束，消除子圈，gp.quicksum()方法可实现快速求和
+            model.cbLazy(gp.quicksum(model._vars[i, j] for i, j in combinations(tour, 2))
+                         <= len(tour) - 1)
+
+
+# 输入值是tuplelist类型的数据，表示边，找到其最短的子回路，返回值是列表
+def subtour(edges):
+    unvisited = cities[:]
+    cycle = cities[:]
+    while unvisited:
+        thiscycle = []
+        neighbors = unvisited
+        while neighbors:
+            current = neighbors[0]
+            thiscycle.append(current)
+            unvisited.remove(current)
+            neighbors = [j for i, j in edges.select(current, '*')
+                         if j in unvisited]
+        if len(thiscycle) <= len(cycle):
+            cycle = thiscycle
+    return cycle
+
+
+# 这样可以将数据传递给callbacks函数
+m._vars = vars
+# 使用懒惰约束必须将这个参数设为1
+m.Params.lazyConstraints = 1
+# 求解
+m.optimize(subtourelim)
+
+# 获得求出的解的值，从而得到求解除的路径，然后检验如果还存在子圈则求解出错
+vals = m.getAttr('x', vars)
+selected = gp.tuplelist((i, j) for i, j in vals.keys() if vals[i, j] > 0.5)
+tour = subtour(selected)
+assert len(tour) == len(cities)
+
+# 如果求解成功，把路径和求解的最优结果输出一下
+print(f"最优路径为：{tour}.")
+print(f"最优目标值为：{m.ObjVal}")
+
+# 将列表形式的解保存在csv文件中
+filename_csv = "results/" + filename + '.csv'
+with open(filename_csv, 'w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(tour)
+
+"""不知道为什么地图没有办法画出来
+map = folium.Map(location=[40, -95], zoom_start=4)
+
+points = []
+for city in tour:
+    points.append(coordinates[city])
+points.append(points[0])
+
+folium.PolyLine(points).add_to(map)
+
+map
+"""
+
+# 释放模型及环境
+m.dispose()
+gp.disposeDefaultEnv()
+
+# 记录结束时间
+end_time = datetime.datetime.now()
+# 输出运行总时间
+print(f"运行的总时间为： {end_time - start_time}.")
