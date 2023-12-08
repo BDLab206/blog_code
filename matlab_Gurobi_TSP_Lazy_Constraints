@@ -1,0 +1,182 @@
+clear;clc;close all;
+instanceName = 'a280';
+
+%% 数据初始化
+% 读取数据
+[TSP_DisplayData, TSP_EdgeWeight] = uti_readlib_tsp(instanceName);
+% TSP算例算例转换为tsp结构体
+% tsp.d city距离矩阵
+% tsp.n city数量
+[tsp] = uti_lib2struct(TSP_DisplayData, TSP_EdgeWeight);
+
+% Part1: 数据初始化
+n = tsp.n;      % city数量
+c = tsp.d;      % cost矩阵
+% 对角线改为无穷大->避免自身被选中
+for i=1:n
+    c(i,i) = 99999;
+end
+
+%% 开始yalmip建模
+
+% yalmpi内部对象清除
+yalmip('clear');
+tic
+
+% 定义决策变量
+x=binvar(n,n,'full');
+% u是为了防止子圈而设置的辅助变量，需要注意一下的是，这里u是列向量
+% u = intvar(n,1);
+
+% 设置约束
+% 离开约束，改用向量化方式
+Leave_Vec = [sum(x(:, :), 2) == ones(n, 1)];
+% 到达约束，改用向量化方式
+Arrive_Vec = [sum(x(:, :)) == ones(1, n)];
+
+% 目标函数
+z = sum(sum(c.*x));
+
+% 设置求解器参数
+options = sdpsettings('verbose',0,'solver','Gurobi','showprogress',0);j
+
+% 合并约束，仅包含离开约束和到达约束
+C = [Leave_Vec, Arrive_Vec];
+fprintf('Matlab转换模型耗时合计%.2f秒; \n', toc);
+sum_time = toc;
+
+%% 直接调用gurobi来求解，这个时候结果很可能会有子圈
+% 调用gurobi求解
+result = optimize(C,z,options);
+
+%% 重头戏来了，通过懒惰约束的方式，来逐个增加不许子圈的约束
+% fun_getfun_getSolGraph:计算子回路索引和数量
+% tourIdxs:客户子圈索引
+% numtours:子圈数量
+
+iter = 1;
+[subTours, numtours] = fun_getSubTours(value(x));
+fprintf('第1次Optimize: %d条子回路; TSP目标值为: %.2f \n',numtours,value(z));
+fprintf('TSP耗时 %.3f秒 \n ', result.solvertime);
+sum_time = sum_time+result.solvertime;
+
+Cons_Lazy_CCC = [];
+Cons_Lazy_MTZ = [];
+while numtours > 1 %子回路数量>1，循环执行此约束。子回路数量等于1，证明是汉密尔顿循环本身（大圈）
+
+    for ii = 1:numtours  % 循环每个subTours(子回路), 增加需破除的'新'约束
+        
+        iTour = subTours{ii};
+        idxs1 = nchoosek(iTour,2);
+        idxs2 = fliplr(idxs1);
+        idxs = [idxs1;idxs2];
+        ind = sub2ind([n,n],idxs(:,1),idxs(:,2));
+
+        % ★:方法1 Done: 子集S内所有可能arcs的组合,其中为1的数量sum <= 集合点数-1
+        Cons_Lazy_CCC = [Cons_Lazy_CCC, sum(x(ind)) <= (nnz(iTour) - 1) ];   % 向量化写法
+        %x是二维决策变量矩阵
+
+        % ★:方法2 Done: MTZ约束: 消除子约束 ui-uj+(n-1)*xij<=n-2, 2<=i neq j <=n
+        % Cons_Lazy_MTZ = [Cons_Lazy_MTZ, u(idxs(:,1)) - u(idxs(:,2)) + (n-1)*x(ind) <= n-2 ];
+
+    end
+
+    % 再次优化模型
+    C = [C; Cons_Lazy_CCC];   % 相比MTZ的计算速度更快
+    % C = [C; Cons_Lazy_MTZ];
+
+    % options.gurobi.LazyConstraints = 1;
+    result = optimize(C, z, options);
+
+    % 再次计算子回路
+    iter = iter+1;
+    [subTours,numtours] = fun_getSubTours(value(x)); %再次回到求子回路的函数中
+    fprintf('第%d次Optimize: %d条子回路; TSP目标值为: %.2f  \n',iter,numtours,value(z));
+    fprintf('TSP耗时 %.3f秒 \n', result.solvertime);
+    sum_time = sum_time+result.solvertime;
+    
+end
+
+%% 优化结果分析
+if result.problem == 0
+ % Extract and display value
+ solutionx = value(x);
+ obj = value(z);
+ fprintf('TSP目标值为: %.2f  \n ', obj);
+ fprintf('TSP耗时 %.3f秒 \n ', sum_time);
+else
+ disp('Hmm, something went wrong!');
+ result.info
+ yalmiperror(result.problem)
+end
+
+
+[sol] = solTran_IP2Permutation(tsp,result,solutionx,z);
+fprintf('TSP的Permutation为: %s \n', join(string(sol.L)) );
+
+% 绘图
+figure(1);
+uti_plotSolution_TSP(tsp,sol);
+pause(0.0);
+
+% 保存数据
+csvwrite(strcat(instanceName,'.csv'),sol.L);
+
+
+%% 局部函数
+function [sol] = solTran_IP2Permutation(tsp,result,solutionx,z)
+
+    n = tsp.n;
+
+    % 转换Position:线路顺序 - 从0-1矩阵到具体位置索引
+    Position = zeros(1,n);
+    for i=1:n
+    posIdx(i) = find( solutionx(i,:));
+    end
+    for i=1:n-1
+        if i==1
+            Position(i) = posIdx(i);
+        end
+        Position(i+1) = posIdx(Position(i));
+    end
+
+    % Save to sol Solution
+    sol.Cost = z;
+    sol.Time = result.solvertime;
+    sol.L = Position;
+end
+
+function [subTours,numtours] = fun_getSubTours(solx)
+
+[a,b]  = find(logical(solx));%ab共同形成索引，行+列
+
+iTour = 1;
+subTours = [];
+n = numel(a);% n为a中的元素个数
+visitedTour = false(n,1); % n条arc是否访问
+
+while ~all(visitedTour)%all函数作用：检验矩阵中是否全为非0元素
+    ii = find(~visitedTour,1,'first');%索引visitedTour中第一个0元素，自上而下的检索
+
+    aTour = [a(ii),b(ii)];% aTour表示这个环路包含什么
+    visitedTour(ii) = true;% 表示该非零元素已被访问
+    
+    nextTourIdx = a==aTour(end);%aTour中最后一个点在a的什么位置，该位置对应的数字就是本次到达的城市
+    nextCity = b(nextTourIdx);%下一个访问的城市建立在本次到达的基础上
+    visitedTour = visitedTour | nextTourIdx;
+
+    while ~ismember(nextCity,aTour)%判断某元素是否属于特定数集
+        aTour = [aTour, nextCity];
+        nextTourIdx = a == aTour(end);
+        nextCity = b(nextTourIdx);
+        visitedTour = visitedTour | nextTourIdx;
+    end
+
+    subTours{iTour} = aTour;%如果无子回路？（是否一定会产生子回路）
+    iTour = iTour + 1; 
+
+end
+
+    numtours = numel(subTours); % Number of subtours
+
+end
