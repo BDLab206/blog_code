@@ -1,0 +1,157 @@
+import math
+from itertools import permutations
+import gurobipy as gp
+import tsplib95
+import datetime
+import csv
+
+# 记录开始时间
+start_time = datetime.datetime.now()
+
+# 获取原始数据，目标是获得各位置id、各货车id、各位置坐标、两两距离及行驶时间（记得提前把vrp文件存到data文件夹里）
+filename = 'lostluggage5'
+filename_tsp = filename + '.vrp'
+DATA = tsplib95.load('data/' + filename_tsp)
+
+# locations为各位置的id，从0到(n-1)，其中id为0的代表机场，后面称其为“原点”
+n = DATA.dimension
+locations = [*range(n)]
+
+# vans为各货车的id，从0到(K-1)，这里就先默认都是6辆吧
+K = 6
+vans = [*range(K)]
+
+points = []
+for i in range(n):
+    points.append((DATA.node_coords[i+1][0], DATA.node_coords[i+1][1]))
+
+# 两点之间欧式距离的字典
+# 假设速度为1km/min，距离和所用时间在数值上是一样的
+time = {(i, j): math.sqrt(sum((points[i][k] - points[j][k]) ** 2 for k in range(2)))
+        for i in locations for j in locations if i != j}
+
+# 建立数学模型
+m = gp.Model('lost_luggage_distribution.lp')
+
+# 创建决策变量
+# 车辆k是否从i到j，是则1，不是则0
+x = m.addVars(time.keys(), vans, vtype=gp.GRB.BINARY, name='FromToBy')
+# 车辆k是否访问点i，是则1，不是则0
+y = m.addVars(locations, vans, vtype=gp.GRB.BINARY, name='visitBy')
+# 车辆k是否被用，是则1，不是则0
+z = m.addVars(vans, vtype=gp.GRB.BINARY, name='used')
+# 每辆车的行驶时间（这里以分钟计），这里其实做了个改动，引入了这个松弛变量
+# 不同的算例要设置不同的时间，这里我大多设置的200，但有的算例超出这个时间必须重新设
+t = m.addVars(vans, ub=200, name='travelTime')
+# 最大行驶时间，也是改动引入的
+s = m.addVar(name='maxTravelTime')
+
+# 加入约束条件
+# 对于每个被访问的点以及每辆车来说，如果某辆车没被使用，则这辆车不能访问任何点；
+# 反之，如果这辆车访问了某点，则其一定被使用
+visitCustomer = m.addConstrs((y[i, k] <= z[k] for k in vans for i in locations
+                              if i > 0), name='visitCustomer')
+# 旅行时间不超过某个时长（这里以分钟计）
+# 这其中不包括从最后一个客户点到原点那一块路程所花费的时间
+# 这里用到了新家的变量tk
+travelTime = m.addConstrs((gp.quicksum(time[i, j] * x[i, j, k] for i, j in time.keys() if j > 0) == t[k] for k in vans),
+                          name='travelTimeConstr')
+# 每一个客户点都必须被访问过且只能被访问一次
+visitAll = m.addConstrs((y.sum(i, '*') == 1 for i in locations if i > 0), name='visitAll')
+# 原点必须被每个使用过的货车访问
+depotConstr = m.addConstr(y.sum(0, '*') >= z.sum(), name='depotConstr')
+# 每个客户点只能被另一个点访问一次
+ArriveConstr = m.addConstrs((x.sum('*', j, k) == y[j, k] for j, k in y.keys()), name='ArriveConstr')
+# Leaving a customer location constraint
+LeaveConstr = m.addConstrs((x.sum(j, '*', k) == y[j, k] for j, k in y.keys()), name='LeaveConstr')
+# 打破对称约束
+breakSymm = m.addConstrs((y.sum('*', k-1) >= y.sum('*', k) for k in vans if k > 0), name='breakSymm')
+# 最大时间的约束，用到tk
+maxTravelTime = m.addConstrs((t[k] <= s for k in vans), name='maxTravelTimeConstr')
+# 通常还可以这么写:
+# maxTravelTime = m.addConstr(s == gp.max_(t), name='maxTravelTimeConstr')
+
+# 设置目标函数
+# 这里用到了两个分级目标，首先是货车数最小，其次是最小化最大时间
+m.ModelSense = gp.GRB.MINIMIZE
+m.setObjectiveN(z.sum(), 0, priority=1, name="Number of vans")
+m.setObjectiveN(s, 1, priority=0, name="Travel time")
+
+
+# Callbacks函数，用来找子回路
+def subtourelim(model, where):
+    if where == gp.GRB.Callback.MIPSOL:
+        # make a list of edges selected in the solution
+        vals = model.cbGetSolution(model._x)
+        selected = gp.tuplelist((i,j) for i, j, k in model._x.keys()
+                                if vals[i, j, k] > 0.5)
+        # find the shortest cycle in the selected edge list
+        tour = subtour(selected)
+        if len(tour) < n:
+            for k in vans:
+                model.cbLazy(gp.quicksum(model._x[i, j, k]
+                                         for i, j in permutations(tour, 2))
+                             <= len(tour)-1)
+
+
+# 给定一组边（tuplelist形式），计算返回最小的子回路
+def subtour(edges):
+    unvisited = list(range(1, n))
+    cycle = range(n+1)  # initial length has 1 more city
+    while unvisited:
+        thiscycle = []
+        neighbors = unvisited
+        while neighbors:
+            current = neighbors[0]
+            thiscycle.append(current)
+            if current != 0:
+                unvisited.remove(current)
+            neighbors = [j for i, j in edges.select(current, '*')
+                         if j == 0 or j in unvisited]
+        if 0 not in thiscycle and len(cycle) > len(thiscycle):
+            cycle = thiscycle
+    return cycle
+
+
+# 模型验证
+m.write('lost_luggage_distribution.lp')
+
+# 运行，模型求解
+m._x = x
+m.Params.LazyConstraints = 1
+m.optimize(subtourelim)
+
+# 用routes来保存最终结果，用于后续把结果存到csv文件中
+routes = []
+
+# 结果分析
+# 打印最终结果，即各货车的运行路线以及行驶时间
+for k in vans:
+    route = gp.tuplelist((i, j) for i, j in time.keys() if x[i, j, k].X > 0.5)
+    routes.append([])
+    if route:
+        i = 0
+        routes[k].append(i)
+        print(f"Route for van {k}: {i}", end='')
+        while True:
+            i = route.select(i, '*')[0][1]
+            routes[k].append(i)
+            print(f" -> {i}", end='')
+            if i == 0:
+                break
+        print(f". Travel time: {round(t[k].X,2)} min")
+
+# 打印货车最大行驶时间
+print(f"Max travel time: {round(s.X,2)}")
+
+# 将列表形式的解保存在csv文件中（记得建立一个results文件夹）
+filename_csv = "results/" + filename + '.csv'
+with open(filename_csv, 'w', newline='') as file:
+    writer = csv.writer(file)
+    for i in range(len(routes)):
+        writer.writerow(routes[i])
+
+# 记录结束时间
+end_time = datetime.datetime.now()
+# 输出运行总时间
+print(f"运行的总时间为： {end_time - start_time}.")
