@@ -1,0 +1,662 @@
+clc; clear; close all;
+
+% 随机数产生
+rng(1)
+% maxDuration为行驶时长限制
+maxDuration = 200;
+
+% vrp文件名
+instanceName = 'lostluggage8';
+
+% 读取标准VRP算例
+% vrp.depot 默认1（即向量第1个位置为depot）
+[VRP_DisplayData, VRP_EdgeWeight, VRP_Capacity, VRP_Demand, VRP_Depot] = readlib_cvrp(instanceName);
+
+% VRP算例转换为vrp结构体
+% vrp.I 待访问点的数量，不包括"原点"
+% vrp.d 距离矩阵，不算原点
+% vrp.d0 原点到其它各点的距离
+% vrp.w 各点需求量(不含原点)
+% vrp.W 车辆最大容量
+% vrp.J 车辆数量
+[vrp] = uti_lib2struct_vrp(VRP_DisplayData, VRP_EdgeWeight, VRP_Capacity, VRP_Demand, VRP_Depot); 
+
+% 求解算法和参数设置 
+vrp.maxDuration = maxDuration;
+solver = 'VRP_IP_threeIndexVehicleFlow';   %'VRP_IP_threeIndexVehicleFlow' 'VRP_IP_twoIndexVehicleFlow'
+par.eliminateSubtour = 'SEC';   % 'MTZ' 463个 > 'SEC' 967个 >  'CCC' 3263个约束 for toy8
+par.solver = 'Gurobi';     % 'Gurobi'   ''  
+par.verbose = 0;  % By setting verbose to 0, the solvers will run with minimal display. By increasing the value, the display level is controlled (typically 1 gives modest display level while 2 gives an awful amount of information printed).
+par.debug   = 1;    % If debug is turned on, YALMIP will not try to catch errors, which will simplify finding out where and why YALMIP failed unexpectedly.
+par.showprogress = 1; % When the field showprogress is set to 1, the user can see what YALMIP currently is doing (might be a good idea for large-scale problems).
+par.ISPLOT = 1; 
+
+%% Part1: 数据初始化
+V = vrp.I;      % 待访问点的数量，不包括"原点"
+K = vrp.J;      % 车辆数量
+bigM = 9999;  
+c = vrp.d;      % 距离矩阵，不算原点
+for i=1:V
+    c(i,i) = bigM; % 对角线费用改为无穷大->避免自身被选中for i=1:V
+end
+
+c0 = vrp.d0;      % 原点到其它各点的距离
+V = V + 1;        % 数据预处理;原点和待访问点合并
+K = K;
+
+dNew = bigM*ones(V,V);
+dNew(1,:) = [0 c0];
+dNew(:,1) = [0; c0'];
+dNew(2:end,2:end) = c;
+d=dNew;     %距离矩阵更新，加入原点
+
+maxDuration = vrp.maxDuration;  % 行驶时间限制
+
+%%  Part2: Yalmip建模
+yalmip('clear')
+tic
+% 定义决策变量
+% 车辆k是否从i到j，是则1，不是则0
+x = binvar(V,V,K,'full');
+% 车辆k是否访问点i，是则1，不是则0
+y = binvar(V,K,'full');
+% 车辆k是否被用，是则1，不是则0
+z = binvar(K,1,'full'); 
+
+%% Part3:定义约束
+Constraints = [];
+% 这个约束原文件写得不太对，和（3）重了，但缺少了yik≤zk运行结果却没问题
+% 究其原因，可能是（2）中涉及了z（k），对zk起到了约束作用
+% (1)对任一辆车而言，不考虑depot时，若客户点被访问，则车被使用
+% 每个待访问点都必须被访问且只能被访问一次 一个客户点只能被分配给一辆车
+%for i=2:V  %向量化
+%    Constraints = [Constraints, sum(y(i,:)) <= 1]; %求和至标量
+%end
+
+%(2)行驶时间约束：每辆车的行驶时间不超过某个值（不考虑最后返回原点的时间）
+for k = 1:K %向量化
+    total_distance = sum(sum(d(:,2:V) .* x(:, 2:V, k))); %矩阵相乘,维度保持一致
+    Constraints = [Constraints, total_distance <= maxDuration * z(k)];
+end
+
+%(3)每个待访问点都必须被访问且只能被访问一次  sum(y_ik) = 1 \any i \in V\{0}
+% for i=2:V  %向量化成功
+%     Constraints = [ Constraints, sum(y(i,:)) == 1 ];
+% end
+    Constraints = [Constraints, sum(y(2:V,:),2) == ones(V-1, 1)];
+
+%(4)若车被使用，则一定访问depot。被使用的车数目为z
+    Constraints = [Constraints, sum(y(1,:)) >=sum(z) ];
+    % Constraints = [ Constraints, sum(y(1,:)) <= K ]  更通用
+    % 取>=的意义？取==似乎也可行
+
+%(5)进出平衡约束。每个customers(含depot)的进出Flow一致
+   %向量化
+for k=1:K %注意：有的点不一定被第k辆车访问，所以不一定能得到ones矩阵
+    Leave = sum(x(:,:,k), 2) == y(:,k); % 离开约束，行求和得到列向量
+    Arrive = sum(x(:,:,k), 1) == y(:,k)'; % 到达约束，列求和得到行向量
+    Constraints = [Constraints, Leave, Arrive];
+end
+
+%(6)打破对称性约束：前1辆车比后1辆车得到了更为充分的利用（目标之一是Min车辆数）
+for k=1:K-1
+    Constraints = [ Constraints, sum(y(:,k))>=sum(y(:,k+1))];
+end
+
+%% Part4:定义目标函数，设置参数
+  Objective1 = sum(z);%最小化使用的车辆数
+  %s = sdpvar(K,1);
+ 
+  maxs = sdpvar(1,1);
+ for k=1:K %对所有车辆（路径）而言
+      % s(k) = sum(sum(x(:,2:V,k).*d(:,2:V)));
+     Constraints = [Constraints; maxs >= sum(sum(x(:,2:V,k).*d(:,2:V)))];
+     %maxs比任何一条路径的长度值都要大，等价于找max(s)
+     %用约束替代Max，MATLAB中使用max将造成非线性
+ end
+ 
+ Objective2 = maxs;  % 每辆车的路径成本
+
+ d = d - diag(diag(d));
+ c =V*max(d(:));  %取值有科学依据
+ %c = 9999，不必取这么大
+ Objective=[ c*Objective1 + Objective2 ] ; %同时最小化车辆数和总路径成本/单条路线最长距离
+
+% Set some options for YALMIP and solver
+options = sdpsettings('verbose',par.verbose,'solver',par.solver,'showprogress',par.showprogress,'savesolveroutput',1,'savesolverinput',1);
+
+fprintf('Matlab转换模型耗时合计%.2f秒;如此部分耗时过多,对耗时约束或目标采用向量化 \n', toc);
+
+ %% Part5: Gurobi优化并获取x解
+% Solve the problem
+sol_IP = optimize(Constraints,Objective,options);
+
+%% Part6: while循环:增加LazyConstriant部分
+% % fun_getSolGraph：计算子回路索引和数量
+%   tourIdxs: 客户的子回路索引
+%   numtours: 子回路数量  
+iter = 1;
+[finalOutput,vehcle_used] = fun_getSubTours(x,y,z,value(x),value(y),value(z));
+while finalOutput.totalnumtours >  0
+    for ii = 1:finalOutput.totalnumtours  % 循环每个subTours(子回路), 增加需破除的'新'约束
+        iTour = finalOutput.new_subTours{ii};
+        idxs1 = nchoosek(iTour,2);
+        idxs2 = fliplr(idxs1);
+        idxs = [idxs1;idxs2];
+        ind = sub2ind([V,V],idxs(:,1),idxs(:,2));
+        % ★: SEC:每个车辆，子集S:不包含Depot的非空客户集合。S内所有arcs组合数 <= S集合内点数 - 1
+             for k=1:K
+                % ind = sub2ind([V,V,K],idxs(:,1),idxs(:,2),repmat(k,height(idxs),1));
+                x_in_k = x(:, :, k); % 获取第k个车辆的决策变量矩阵
+                selected_values = x_in_k(ind); % 检索与索引ind对应的元素
+                sum_selected = sum(selected_values); % 对检索的元素进行求和操作
+                switch par.eliminateSubtour
+                case 'SEC'
+        %Constraints = [Constraints, sum(x(ind)) <= (nnz(iTour) - 1) ];
+        Constraints = [Constraints, sum_selected <= (nnz(iTour) - 1) ];
+                end
+             end
+    end
+
+%%  Part7：再次优化模型
+    sol_IP = optimize(Constraints, Objective, options);
+
+%%  Part8：再次计算子回路
+    iter = iter+1;
+    [finalOutput,vehcle_used] = fun_getSubTours(x,y,z,value(x),value(y),value(z))
+     %再次回到求子回路的函数中
+    fprintf('第%d次Optimize: %d条子回路; VRP目标值为: %.2f  \n',iter,finalOutput.totalnumtours,value(Objective));
+    fprintf('VRP耗时 %.3f秒 \n', sol_IP.solvertime);  
+end
+
+%%  Part9：Analyze error flags
+if sol_IP.problem == 0
+    % Extract and display value
+    solutionx = value(x);
+    solutiony = value(y);
+    solutionz = value(z);
+    obj = value(Objective);
+
+    nbConstraints = size(Constraints);
+    nbConstraints = nbConstraints(1);
+
+    if isfield(sol_IP,'solveroutput') && strcmp(par.solver,'Gurobi')
+        result = sol_IP.solveroutput.result; % Variable types: 0 continuous, 553 integer (504 binary)
+        nbVariables = numel(result.x);
+        fprintf('Gurobi求解状态: %s 过程解 %s  \n ', result.status, join(string([result.pool.objval])));
+    else
+        nbVariables = NaN;
+    end
+
+    fprintf('VRP采用%s子回路消除,变量数%d个,约束数%d个 \n ', par.eliminateSubtour,nbVariables,nbConstraints);
+    fprintf('所用车辆数: %.2f ', sum(value(z)));
+else
+    display('Hmm, something went wrong!');
+    sol_IP.info
+    yalmiperror(sol_IP.problem)
+end
+%  从Yalmip解转换到VRP的解
+[sol] = solTran_IP2Permutation(vrp,sol_IP,solutionx,obj);
+% % 打印CVRP解
+uti_print_vrproute(sol,vrp)
+
+if par.ISPLOT
+    % Plot Best Solution
+    figure(1);
+    Sol=struct; Sol.sol=sol;
+    uti_plotSolution_VRP(vrp,Sol);
+    pause(0.01);
+end
+
+function [sol] = solTran_IP2Permutation(vrp,sol_IP,solutionx,obj)
+% 基于Yalmip的Sol作图
+Res = 0.00000001;
+K=size(solutionx,3);
+V=size(solutionx,1);
+
+% % 转换0-1矩阵到线路cell的L
+L = cell(K,1);
+for k=1:K
+    posIdx=[];
+    xInK = solutionx(:,:,k);
+    n = V;
+    
+    if any(abs(xInK(1, :) - 1) < Res)
+    pos = find( abs(xInK(1,:) - 1) < Res ); %找到绝对值小于Res的元素的索引，赋给pos
+    posIdx(1) = pos; %将pos的值赋给posIdx的第一个元素
+    posNext = find( abs(xInK(pos,:) - 1) < Res ); % find( xInK(pos,:));
+    else pos = 1;
+        posIdx(1) = pos;
+        posNext = 1;
+    end
+    while ~isempty(posNext) && posNext~=1
+        posIdx = [posIdx; posNext];
+        posNext = find( abs(xInK(posNext,:) - 1) < Res ); % posNext = find( xInK(posNext,:));
+        if posNext==1, break; end
+    end
+    L{k} = posIdx-1;
+end
+
+% L为空的移除
+isEmpty = false(1,K);%创建1行k列的0矩阵
+for k=1:K
+    if L{k}==0
+        isEmpty(k) = true;
+    end
+end
+L(isEmpty) = []; %对cell数组L进行索引，找出对应位置为true的元素，然后将空数组赋
+                 %给这些元素
+% 计算每个线路长度
+lenL=zeros(numel(L),1);
+weightL=zeros(numel(L),1);
+for ii=1:numel(L)
+    nodes=L{ii};
+    %包含仓库到第一个和最后一个客户点的距离
+    % lenL(ii)= vrp.d0(nodes(1))+vrp.d0(nodes(end)); 
+
+    %只包含仓库到第一个客户点的距离
+    lenL(ii)= vrp.d0(nodes(1));
+    for jj=1:numel(nodes)-1
+        lenL(ii)= lenL(ii) + vrp.d(nodes(jj),nodes(jj+1));
+    end
+end
+
+% Save to BestSol Solution
+sol.Cost = obj;
+sol.Time = sol_IP.solvertime;
+sol.L = L;
+sol.lenL=lenL;
+end
+
+%% 寻找子回路函数  struct写法
+function [finalOutput,vehcle_used] = fun_getSubTours(x,y,z,solx,soly,solz)
+% 初始化最终输出结构体
+finalOutput = struct();
+finalOutput.numtours = [];
+finalOutput.new_subTours = [];
+
+indz = find(solz);
+totalnumtours = 0; % 初始化总子回路数量为0
+for i = 1:numel(indz)
+    vehcle_used = indz(i);
+    [a,b]  = find((solx(:,:,vehcle_used)>0.5));  % ab共同形成索引，行+列
+    
+    iTour = 1;
+    subTours = {};
+    n = numel(a);
+    visitedTour = false(n,1); % n条arc是否访问
+
+    while ~all(visitedTour)
+        ii = find(~visitedTour,1,'first'); % 索引visitedTour中第一个0元素，自上而下的检索
+        %有的车辆虽被使用，但solx矩阵第一行全为0（不违反约束2）
+        aTour = [a(ii),b(ii)];
+        visitedTour(ii) = true;
+    
+        nextTourIdx = a==aTour(end);
+        nextCity = b(nextTourIdx);
+        visitedTour = visitedTour | nextTourIdx;
+
+        while ~ismember(nextCity,aTour)
+            aTour = [aTour, nextCity];
+            nextTourIdx = a == aTour(end);
+            nextCity = b(nextTourIdx);
+            visitedTour = visitedTour | nextTourIdx;
+        end
+        subTours{iTour} = aTour;
+        iTour = iTour + 1; 
+    end
+     numtours = numel(subTours); % Number of subtours
+        depotId = 1;
+        inew = 1; 
+        new_subTours = {};
+    for ii=1:numtours
+        iTour = subTours{ii};
+        if (~any(iTour==depotId) && numel(iTour)>=2) %无容量约束Q
+            iTour(iTour==depotId) = [];
+            new_subTours{inew} = iTour;
+            inew = inew+1;
+        end
+    end
+    numtours = numel(new_subTours);
+    totalnumtours = totalnumtours + numtours; % 将numtours添加到总数中
+    finalOutput.numtours = [finalOutput.numtours, numtours];%记录每辆车产生几条子回路
+    finalOutput.new_subTours = [finalOutput.new_subTours, new_subTours];
+end
+    finalOutput.totalnumtours = totalnumtours; % 总子回路数量
+end
+
+function uti_print_vrproute(sol,vrp)
+
+L = sol.L;
+for j = 1:numel(L)
+    if isempty(L{j}),  continue; end
+   fprintf('路线%d不包含返回仓库的距离 %.2f ', j, sol.lenL(j));    % 打印每条线路的客户点
+   route = L{j};
+     fprintf('车辆访问序列：0 ');
+    for r = 1:numel(route)
+        fprintf('%d ', route(r));
+    end
+    fprintf('0\n');
+end
+    fprintf('不含返回仓库的单条路径最大长度 %.2f',max(sol.lenL));
+end
+
+function uti_plotSolution_VRP(vrp,Sol)
+
+    
+    J=vrp.J;
+
+    xmin=vrp.xmin;
+    xmax=vrp.xmax;
+    ymin=vrp.ymin;
+    ymax=vrp.ymax;
+    
+    x=vrp.x;
+    y=vrp.y;
+    x0=vrp.x0;
+    y0=vrp.y0;
+    
+    if nargin == 1
+        L=[];
+    else
+        L=Sol.sol.L;
+    end
+
+    plot(x0,y0,'ks',...
+        'LineWidth',1,...
+        'MarkerSize',8,...
+        'MarkerFaceColor','b');
+    hold on;
+    plot(x,y,'ks',...
+        'LineWidth',1,...
+        'MarkerSize',4,...
+        'MarkerFaceColor','y');
+    hold on;
+
+    Colors=hsv(J);
+    if ~isempty(L)
+        for j=1:J
+            
+            if j>numel(L) || isempty(L{j})  % 增加j超过L长度时跳出
+                continue;
+            end
+            
+            X=[x0 x(L{j}) x0];
+            Y=[y0 y(L{j}) y0];
+            
+            Color=0.5*Colors(j,:);
+            %   Color=1.0*Colors(j,:);
+            
+            plot(X,Y,'-o',...
+                'Color',Color,...
+                'LineWidth',1,...
+                'MarkerSize',5,...
+                'MarkerFaceColor','white');
+            hold on;
+            
+            % 增加position
+            A = L{j}';
+            B = ones(1,numel(L{j}))';
+            if isrow(A)
+                A=A';
+            end
+            str = mat2cell(A,B);
+            text(vrp.x(L{j}),vrp.y(L{j}), str, 'Color','red','FontSize',10);
+        end
+    end
+
+
+
+    
+    hold off;
+    grid on;
+    axis equal;
+    
+    xlim([xmin xmax]);
+    ylim([ymin ymax]);
+    
+end
+
+function [VRP_DisplayData, VRP_EdgeWeight, VRP_Capacity, VRP_Demand, VRP_Depot ] = readlib_cvrp(FileName)
+
+   % Define global variables
+   global VRPLIB_FILENAME;
+   global VRPLIB_NAME;
+   global VRPLIB_COMMENT;
+   global VRPLIB_DIMENSION;
+   global VRPLIB_GLOBALOPT;
+   global VRPLIB_BESTTOUR;
+   global VRPLIB_DISPLAYDATA;
+   global VRPLIB_EDGEWEIGHT;
+   % New global variables for VRP
+   global VRPLIB_CAPACITY
+   global VRPLIB_DEMAND_SECTION
+   global VRPLIB_DISTANCE
+   global VRPLIB_DEPOT_SECTION
+   
+   % Reassign nargout
+   NAOUT = nargout;
+
+   % Define some values and set variables empty 
+   ExtDataFile = '.vrp';
+
+   % When no file name is given, ask for one
+   if isempty(FileName),
+      % Open file selection dialog box
+      FilePathLoad = ['*' ExtDataFile];
+      [FileNameData, PathNameData]=uigetfile(FilePathLoad, 'Select file with definition of tsp problem!');
+      if FileNameData == 0,
+         error('The file selection of the data file failed !');
+      else
+         FileName = [PathNameData FileNameData];
+         VRPLIB_FILENAME = strtok(FileNameData, '.');
+      end
+   else
+      FileName = [FileName ExtDataFile];
+   end
+
+   % Set variables to empty
+   VRP_Name =[]; VRP_Comment = []; VRP_Type = []; VRP_Dimension = [];
+   VRP_EdgeWeightType = []; VRP_EdgeWeightFormat = []; VRP_EdgeWeight = [];
+   VRP_DisplayDataType = []; VRP_NodeCoord = []; VRP_DisplayData = []; 
+   % New Set variables to empty
+   VRP_Capacity = [];
+   VRP_Distance = [];
+   VRP_Demand = [];
+   VRP_Depot = [];
+   
+   % Open the data file and test for errors
+   [fidtsplib, error_message] = fopen(FileName, 'rt');
+   if fidtsplib == -1, 
+      disp(sprintf('error during fopen of data file (%s): %s', FileName, error_message));
+   else
+      % Process data in the data file
+      DataFileRead = 1;
+      while DataFileRead,
+         Line = fgetl(fidtsplib);
+         if any([~ischar(Line), strmatch('EOF', Line)]),
+            DataFileRead = 0;
+            break
+         end
+         [VRPOpt, LineRem] = strtok(Line, ':');
+         if strmatch('NAME', VRPOpt),
+            VRP_Name = strtok(LineRem(2:end));
+            
+         elseif strmatch('COMMENT', VRPOpt),
+            VRP_Comment = strvcat(VRP_Comment, LineRem(2:end));
+            
+         elseif strmatch('TYPE', VRPOpt),
+            VRP_Type = strtok(LineRem(2:end));
+            
+         elseif strmatch('DIMENSION', VRPOpt),
+            VRP_Dimension = sscanf(strtok(LineRem(2:end)), '%g');
+
+         elseif strmatch('EDGE_WEIGHT_TYPE', VRPOpt),
+            VRP_EdgeWeightType = strtok(LineRem(2:end));
+            
+         elseif strmatch('EDGE_WEIGHT_FORMAT', VRPOpt),
+            VRP_EdgeWeightFormat = strtok(LineRem(2:end));
+
+         elseif strmatch('DISPLAY_DATA_TYPE', VRPOpt),
+            VRP_DisplayDataType = strtok(LineRem(2:end));
+
+         % New VRP    
+         elseif strmatch('CAPACITY', VRPOpt),
+            VRP_Capacity = sscanf(strtok(LineRem(2:end)), '%g');
+            
+         elseif strmatch('DISTANCE', VRPOpt),
+            VRP_Distance = sscanf(strtok(LineRem(2:end)), '%g');
+      
+         elseif strmatch('DEMAND_SECTION', VRPOpt),
+            IxData = 1;
+            for IxData = 1:VRP_Dimension,
+               Line = fgetl(fidtsplib);
+               Data = sscanf(Line, '%g');
+               VRP_Demand(IxData, :) = Data([2:2])';
+            end
+            
+         elseif strmatch('DEPOT_SECTION', VRPOpt),
+            IxData = 1;
+            for IxData = 1:2,            % maxmim nb is 2
+               Line = fgetl(fidtsplib);
+               Data = sscanf(Line, '%g');
+               VRP_Depot(IxData, :) = Data([1:1])';
+            end
+            VRP_Depot(VRP_Depot==-1)=[]; % end by -1
+        % New VRP END
+            
+         elseif strmatch('NODE_COORD_SECTION', VRPOpt),
+            IxData = 1;
+            for IxData = 1:VRP_Dimension,
+               Line = fgetl(fidtsplib);
+               Data = sscanf(Line, '%g');
+               VRP_NodeCoord(IxData, :) = Data([2:end])';
+            end
+         
+         elseif strmatch('EDGE_WEIGHT_SECTION', VRPOpt),
+            IxData = 1;
+            for IxData = 1:VRP_Dimension,
+               Line = fgetl(fidtsplib);
+               Data = sscanf(Line, '%g');
+               if strmatch('FULL_MATRIX', VRP_EdgeWeightFormat),
+                  VRP_EdgeWeight(IxData, :) = Data';
+               elseif strmatch('UPPER_ROW', VRP_EdgeWeightFormat),
+                  if IxData > 1, AddData = VRP_EdgeWeight(1:IxData-1, IxData); else AddData = []; end
+                  VRP_EdgeWeight(IxData, :) = [AddData', 0, Data'];
+                  if IxData == VRP_Dimension-1,
+                     IxData = IxData+1;
+                     VRP_EdgeWeight(IxData, :) = [VRP_EdgeWeight(1:IxData-1, IxData)', 0];
+                     break;
+                  end
+               end
+            end
+
+         elseif strmatch('DISPLAY_DATA_SECTION', VRPOpt),
+            IxData = 1;
+            for IxData = 1:VRP_Dimension,
+               Line = fgetl(fidtsplib);
+               Data = sscanf(Line, '%g');
+               VRP_DisplayData(IxData, :) = Data(2:end)';
+            end
+
+         elseif any([isempty(VRPOpt), all(isspace(VRPOpt))]),
+            % do nothing
+            
+         else
+            warning(sprintf('unrecognized option: %s', VRPOpt));
+         end
+
+      end
+
+      if all([isempty(VRP_DisplayData), ~(isempty(VRP_NodeCoord))]),
+         if any([strmatch('COORD_DISPLAY', VRP_DisplayDataType), isempty(VRP_DisplayDataType)])
+            VRP_DisplayData = VRP_NodeCoord;
+         end
+      end
+
+      fclose(fidtsplib);
+   end
+
+
+   % Compute the Edge Weights, when not given
+   if isempty(VRP_EdgeWeight),
+      Nedge = size(VRP_NodeCoord, 1);
+      if ~(isempty(VRP_Dimension)), 
+         if Nedge ~= VRP_Dimension,
+            warning('Number of coordinates and defined dimension in data file are not equal!');
+         end
+      end
+      % Preset the edge weight matrix with zeros
+      VRP_EdgeWeight = zeros([Nedge, Nedge]); 
+      % Calculate the edge weight according to the edge weight type
+      if strmatch('EUC_2D', VRP_EdgeWeightType),
+         for iedge = 1:Nedge,
+            % create full matrix with edge weights (distances), every distance twice,
+            Diff1 = repmat(VRP_NodeCoord(iedge,:), [Nedge 1]);
+            Diff2 = VRP_NodeCoord;
+            % Diff1(1:10,:)-Diff2(1:10,:), pause
+            VRP_EdgeWeight(iedge,:) = round(sqrt(sum(((Diff1 - Diff2).^2)')));
+         end
+         
+      else
+         warning(sprintf('Unknown Edge Weight Type: %s !', VRP_EdgeWeightType));
+         VRP_EdgeWeight = []; 
+      end
+   end
+
+   
+   % Assign local data to global variables
+   VRPLIB_NAME = VRP_Name;
+   VRPLIB_COMMENT = VRP_Comment;
+   VRPLIB_DIMENSION = VRP_Dimension;
+   VRPLIB_DISPLAYDATA = VRP_DisplayData;
+   VRPLIB_EDGEWEIGHT = VRP_EdgeWeight;
+    
+   % New Assign local data to global variables
+   VRPLIB_CAPACITY = VRP_Capacity;
+   VRPLIB_DEMAND_SECTION = VRP_Demand;
+   VRPLIB_DISTANCE = VRP_Distance;
+   % VRPLIB_DEPOT_SECTION = VRP_Depot;
+
+   
+   % Output some data
+   format compact;
+   fprintf('Name: %s,  Type: %s,  Dimension: %g,  size EdgeWeight: %s (', ...
+           VRPLIB_NAME, VRP_Type, VRPLIB_DIMENSION, sprintf('%g  ', size(VRPLIB_EDGEWEIGHT)));
+   if ~(isempty(VRP_EdgeWeightType)), fprintf('%s', VRP_EdgeWeightType); end
+   if ~(isempty(VRP_EdgeWeightFormat)), fprintf('  %s', VRP_EdgeWeightFormat); end
+   fprintf('), size DisplayData: %s \n', sprintf('%g  ', size(VRPLIB_DISPLAYDATA)));
+   % fprintf('size VRP_NodeCoord: %g  %g\n', size(VRP_NodeCoord,1), size(VRP_NodeCoord,2));
+end
+
+
+function [vrp] = uti_lib2struct_vrp(VRP_DisplayData, VRP_EdgeWeight, VRP_Capacity, VRP_Demand, VRP_Depot)
+%uti_lib2struct_vrp 转换Lib格式算例 到 struct的vrp格式
+%   此处显示详细说明
+
+VRP_Demand(VRP_Depot) = []; 
+vrp.I = numel(VRP_Demand);    % nb of customer
+%vrp.J = vrp.I;                % nb of vehicle   车辆数等同city数（车辆上界）
+vrp.J = 6;
+vrp.W = repmat(VRP_Capacity,1,vrp.J);  % 车辆容量
+vrp.w = VRP_Demand';                   % city需求量
+
+vrp.xmin = min(VRP_DisplayData(:,1));
+vrp.xmax = max(VRP_DisplayData(:,1));
+vrp.ymin = min(VRP_DisplayData(:,2));
+vrp.ymax = max(VRP_DisplayData(:,2));
+vrp.x0 = VRP_DisplayData(VRP_Depot,1);
+vrp.y0 = VRP_DisplayData(VRP_Depot,2);
+
+VRP_DisplayData(VRP_Depot,:) = []; 
+vrp.x = VRP_DisplayData(:,1)';
+vrp.y = VRP_DisplayData(:,2)';
+
+vrp.d0 = VRP_EdgeWeight(VRP_Depot,:);
+vrp.d0(VRP_Depot) = [];
+
+VRP_EdgeWeight(VRP_Depot,:) = []; 
+VRP_EdgeWeight(:,VRP_Depot) = []; 
+vrp.d = VRP_EdgeWeight;      % 距离矩阵
+
+end
