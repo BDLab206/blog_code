@@ -1,0 +1,152 @@
+import math
+from itertools import combinations
+import gurobipy as gp
+import datetime
+import csv
+
+# 记录开始时间
+start_time = datetime.datetime.now()
+
+# 这里是本次所用的数据，farms为tuplelist类型的数据，0代表仓库，1~20代表需要去收集的农场
+# coordinates和collect为tupledict类型的数据，分别对应位置坐标和所需收集的牛奶量
+farms, coordinates, collect = gp.multidict(
+    {0: [(0, 0), 0], 1: [(-3, 3), 5], 2: [(1, 11), 4], 3: [(4, 7), 3],
+     4: [(-5, 9), 6], 5: [(-5, -2), 7], 6: [(-4, -7), 3], 7: [(6, 0), 4],
+     8: [(3, -6), 6], 9: [(-1, -3), 5], 10: [(0, -6), 4], 11: [(6, 4), 7],
+     12: [(2, 5), 3], 13: [(-2, 8), 4], 14: [(6, 10), 5], 15: [(1, 8), 6],
+     16: [(-3, 1), 8], 17: [(-6, 5), 5], 18: [(2, 9), 7], 19: [(-6, -5), 6],
+     20: [(5, -4), 6]})
+
+# farms的id列表
+farms = [*range(0, 21)]
+# 需每天访问的位置的id列表（包括仓库），everyDay⊂farms
+everyDay = [*range(0, 10)]
+# 需每隔一天访问一次的位置的id列表，otherDay⊂farms
+otherDay = [*range(10, 21)]
+# day的类型，分为"1"和"2"两种
+dayType = [1, 2]
+# 油罐车的容量（单位为1000）
+tankerCap = 80
+# 把每天都要访问的农场的需收集的量加起来，算作总需求，后面会用到
+everyDayReq = 0
+for i in everyDay:
+    everyDayReq += collect[i]
+
+
+# 计算城市之间的距离
+# 由于combinations函数的使用，结果相比距离矩阵来说，去掉对角线，剩下的只取一半
+def distance(city1, city2):
+    c1 = coordinates[city1]
+    c2 = coordinates[city2]
+    diff = (c1[0] - c2[0], c1[1] - c2[1])
+    return math.sqrt(diff[0] * diff[0] + diff[1] * diff[1])
+
+
+dist = {(c1, c2): distance(c1, c2) for c1, c2 in combinations(farms, 2)}
+
+# 下面开始建模求解
+# 创建数学模型
+m = gp.Model('MilkCollection.lp')
+
+# 设置决策变量
+# 在类型为k的这天，如果车访问i和j且i和j在路线上相邻的话，x为1，否则为0
+vars = m.addVars(dist, dayType, vtype=gp.GRB.BINARY, name='x')
+
+# 在类型为k的这天，如果车访问i点的话，y为1，否则为0
+other_var = m.addVars(otherDay, dayType, vtype=gp.GRB.BINARY, name='y')
+
+# j与i的相连情况必然与i与j的相连情况相同
+for i, j, k in vars.keys():
+    vars[j, i, k] = vars[i, j, k]
+
+# 对于每天都要访问的农场来说，在访问路径上必然与另外两个位置相邻
+m.addConstrs((vars.sum(i, '*', k) == 2 for i in everyDay for k in dayType), name='everyDay')
+
+# 对于每隔一天才访问一次的农场来说，如果要访问的话则在访问路线上必然与另外两个位置相邻，如果不访问则在访问路径上没有相邻的点
+m.addConstrs((vars.sum(i, '*', k) == 2 * other_var[i, k] for i in otherDay for k in dayType), name='otherDay')
+
+# 每天收集的牛奶量不能超过油罐车的容量
+m.addConstrs((gp.quicksum(collect[i] * other_var[i, k] for i in otherDay) <= tankerCap - everyDayReq for k in dayType),
+             name='tankerCap')
+
+# 确保otherDay类型的农场每隔一天访问一次
+otherDayFarms = m.addConstrs((other_var.sum(i, '*') == 1 for i in otherDay), name='visited')
+
+# 最优解必然有对称的两个，以id为11的农场为例，要么k为1的时候访问，要么k=2的时候访问，这里其实就是说只取其中一种的意思
+other_var[11, 1].lb = 1
+
+# 设置目标函数，最小化总的行驶路程
+m.setObjective(gp.quicksum(dist[i, j] * vars[i, j, k] for i, j in dist.keys() for k in dayType), gp.GRB.MINIMIZE)
+
+
+# 以tuplelist的数据形式给出解代表的边
+def selected(vals):
+    s = {k: gp.tuplelist() for k in dayType}
+    for i, j, k in vals.keys():
+        if vals[i, j, k] > 0.5:
+            s[k].append((i, j))
+    return s
+
+
+# 通过tuplelist形式的边找到最短的子圈
+def subtour(edges):
+    nodes = set(i for e in edges for i in e)
+    unvisited = list(nodes)
+    cycle = list(nodes)
+    while unvisited:
+        thiscycle = []
+        neighbors = unvisited
+        while neighbors:
+            current = neighbors[0]
+            thiscycle.append(current)
+            unvisited.remove(current)
+            neighbors = [j for i, j in edges.select(current, '*')
+                         if j in unvisited]
+        if len(thiscycle) <= len(cycle):
+            cycle = thiscycle
+    return cycle
+
+
+# Callback函数，以懒惰约束的方式消除子圈
+def subtourelim(model, where):
+    if where == gp.GRB.Callback.MIPSOL:
+        # 得到当前解所代表的边
+        vals = model.cbGetSolution(model._vars)
+        edges = selected(vals)
+        for k in dayType:
+            tour = subtour(edges[k])
+            if len(tour) < 0.5 * len(edges[k]):  # 乘以0.5是因为存在对称边
+                # 加入子圈约束
+                model.cbLazy(gp.quicksum(model._vars[i, j, k] for i, j in combinations(tour, 2))
+                             <= len(tour) - 1)
+
+
+# 模型求解
+m.reset()
+m._vars = vars
+m.Params.lazyConstraints = 1
+m.optimize(subtourelim)
+
+# 求解结果的可视化分析
+print(f"最优路线的行驶距离是: {10 * round(m.objVal)} miles.")
+vals = m.getAttr('X', vars)
+edges = selected(vals)
+routes = []
+for k in dayType:
+    tour = subtour(edges[k])
+    routes.append([])
+    routes[k - 1] = tour
+    tour.append(0)  # return to depot
+    print("类型为%i的日期的路线为: %s" % (k, " -> ".join(map(str, tour))))
+
+# 将列表形式的解保存在csv文件中（记得建立一个results文件夹）
+filename_csv = "results/" + 'result.csv'
+with open(filename_csv, 'w', newline='') as file:
+    writer = csv.writer(file)
+    for i in range(len(routes)):
+        writer.writerow(routes[i])
+
+# 记录结束时间
+end_time = datetime.datetime.now()
+# 输出运行总时间
+print(f"运行的总时间为： {end_time - start_time}.")
